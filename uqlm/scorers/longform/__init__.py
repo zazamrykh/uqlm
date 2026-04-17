@@ -15,9 +15,17 @@
 from uqlm.scorers.longform.longtext import LongTextUQ
 from uqlm.scorers.longform.qa import LongTextQA
 from uqlm.scorers.longform.context_groundedness import ContextGroundednessScorer
+from uqlm.scorers.longform.linear_probe import (
+    HallucinationSpan,
+    LinearProbeResult,
+    LinearProbeScorer,
+)
 
 __all__ = [
     "LongTextUQ",
     "LongTextQA",
-    "ContextGroundednessScorer"
+    "ContextGroundednessScorer",
+    "LinearProbeScorer",
+    "LinearProbeResult",
+    "HallucinationSpan",
 ]

@@ -21,8 +21,14 @@ from uqlm.scorers.longform.longtext import LongTextUQ
 from uqlm.scorers.longform.qa import LongTextQA
 from uqlm.scorers.longform.graph import LongTextGraph
 from uqlm.scorers.longform.context_groundedness import ContextGroundednessScorer
+from uqlm.scorers.longform.linear_probe import (
+    HallucinationSpan,
+    LinearProbeResult,
+    LinearProbeScorer,
+)
 
 __all__ = [
     "UQEnsemble", "SemanticEntropy", "LLMPanel", "WhiteBoxUQ", "BlackBoxUQ",
-    "LongTextUQ", "LongTextQA", "LongTextGraph", "ContextGroundednessScorer"
+    "LongTextUQ", "LongTextQA", "LongTextGraph", "ContextGroundednessScorer",
+    "LinearProbeScorer", "LinearProbeResult", "HallucinationSpan"
 ]

@@ -19,16 +19,20 @@ from uqlm.scorers.shortform.baseclass import ShortFormUQ
 from uqlm.scorers.shortform import UQEnsemble, SemanticDensity, SemanticEntropy, LLMPanel, WhiteBoxUQ, BlackBoxUQ
 from uqlm.scorers.longform.baseclass import LongFormUQ
 from uqlm.scorers.longform import (
+    ContextGroundednessScorer,
+    HallucinationSpan,
+    LinearProbeResult,
+    LinearProbeScorer,
     LongTextQA,
     LongTextUQ,
-    ContextGroundednessScorer
 )
 
 __all__ = [
     "UQEnsemble", "SemanticDensity", "SemanticEntropy", "LLMPanel",
     "WhiteBoxUQ", "BlackBoxUQ", "LongTextQA", "LongTextUQ",
     "ShortFormUQ", "LongFormUQ", "UncertaintyQuantifier",
-    "ContextGroundednessScorer"
+    "ContextGroundednessScorer", "LinearProbeScorer", "LinearProbeResult",
+    "HallucinationSpan"
 ]
 
 # Allow submodule imports like `uqlm.scorers.entropy` and `uqlm.scorers.baseclass`

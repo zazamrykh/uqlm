@@ -159,3 +159,57 @@ class TestGetUnifiedGroundednessPrompt:
         prompt = get_unified_groundedness_prompt(sample_context, sample_answer)
         assert "JSON array" in prompt or "JSON" in prompt
         assert "[" in prompt and "]" in prompt
+
+    def test_external_verification_flag_off_excludes_new_fields(self, sample_context, sample_answer):
+        """Default behaviour must NOT request external-verification fields."""
+        prompt = get_unified_groundedness_prompt(sample_context, sample_answer)
+        assert '"need_external_check"' not in prompt
+        assert '"search_queries"' not in prompt
+        assert '"overclaim"' not in prompt
+
+    def test_external_verification_flag_on_includes_new_fields(
+        self, sample_context, sample_answer
+    ):
+        prompt = get_unified_groundedness_prompt(
+            sample_context,
+            sample_answer,
+            enable_external_verification=True,
+        )
+        assert '"need_external_check"' in prompt
+        assert '"search_queries"' in prompt
+        # overclaim must be in the verdict vocabulary.
+        assert "overclaim" in prompt
+
+    def test_external_verification_verdict_is_last_field(self, sample_context, sample_answer):
+        """With external verification enabled, verdict must still be the final field (6)."""
+        prompt = get_unified_groundedness_prompt(
+            sample_context,
+            sample_answer,
+            include_reasoning=True,
+            include_relevant_context=True,
+            enable_external_verification=True,
+        )
+        assert '1. "claim"' in prompt
+        assert '2. "anchor_text"' in prompt
+        assert '3. "relevant_context"' in prompt
+        assert '4. "reasoning"' in prompt
+        assert '5. "need_external_check"' in prompt
+        assert '6. "search_queries"' in prompt
+        assert '7. "verdict"' in prompt
+        # sanity: only one "verdict" field
+        assert prompt.count('"verdict"') >= 1
+
+    def test_external_verification_minimal_flags(self, sample_context, sample_answer):
+        """With reasoning+relevant_context OFF but external verification ON, numbering stays tight."""
+        prompt = get_unified_groundedness_prompt(
+            sample_context,
+            sample_answer,
+            include_reasoning=False,
+            include_relevant_context=False,
+            enable_external_verification=True,
+        )
+        assert '1. "claim"' in prompt
+        assert '2. "anchor_text"' in prompt
+        assert '3. "need_external_check"' in prompt
+        assert '4. "search_queries"' in prompt
+        assert '5. "verdict"' in prompt

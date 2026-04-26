@@ -44,10 +44,15 @@ logger = logging.getLogger(__name__)
 VERDICT_SCORE_MAP: Dict[str, float] = {
     "supported": 1.0,
     "baseless": 0.5,
+    "overclaim": 0.5,
     "contradicted": 0.0,
     "contradiction": 0.0,
     "unknown": np.nan,
+    "not_checked": np.nan,
 }
+
+# Verdicts that trigger Stage 3 external factuality verification.
+EXTERNAL_CHECK_VERDICTS = frozenset({"baseless", "overclaim"})
 
 
 class _BaseGroundednessEngine:
@@ -130,6 +135,17 @@ class _BaseGroundednessEngine:
                         "reasoning": "",
                         "relevant_context": [],
                         "raw_judge_response": raw_response,
+                        # External-verification fields: present but empty for modes
+                        # that do not run Stage 3 (backward compatible default).
+                        "context_verdict": label,
+                        "need_external_check": False,
+                        "search_queries": [],
+                        "world_verdict": "not_checked",
+                        "world_score": np.nan,
+                        "world_reasoning": "",
+                        "evidence_snippets": [],
+                        "evidence_urls": [],
+                        "raw_world_response": None,
                     }
                 )
             claims_data.append(claims_data_i)
@@ -158,6 +174,18 @@ class _BaseGroundednessEngine:
             claims_data
         )
         response_scores = self.aggregate_scores(claim_scores)
+
+        # World-axis parallel views (present regardless of mode so consumers can rely on them).
+        claim_world_labels: List[List[str]] = [
+            [str(c.get("world_verdict", "not_checked")) for c in claim_list]
+            for claim_list in claims_data
+        ]
+        claim_world_scores: List[List[float]] = [
+            [float(c.get("world_score", np.nan)) for c in claim_list]
+            for claim_list in claims_data
+        ]
+        response_world_scores = self.aggregate_scores(claim_world_scores)
+
         return UQResult(
             {
                 "data": {
@@ -169,6 +197,11 @@ class _BaseGroundednessEngine:
                     "claim_labels": claim_labels,
                     "claim_scores": claim_scores,
                     "response_scores": response_scores,
+                    # World-axis views (all "not_checked" / NaN unless Stage 3 ran).
+                    "claim_context_labels": claim_labels,
+                    "claim_world_labels": claim_world_labels,
+                    "claim_world_scores": claim_world_scores,
+                    "response_world_scores": response_world_scores,
                 },
                 "metadata": metadata,
             }
@@ -209,6 +242,7 @@ class _TwoStageGroundednessEngine(_BaseGroundednessEngine):
         return_raw_judge_responses: bool = False,
         show_progress_bars: bool = True,
         return_prompts: bool = False,
+        **_: Any,
     ) -> UQResult:
         progress_bar = self.build_progress_bar(show_progress_bars)
         raw_responses: Optional[List[List[str]]] = None
@@ -322,6 +356,7 @@ class _SinglePromptGroundednessEngine(_BaseGroundednessEngine):
         aggregation: str = "mean",
         include_reasoning: bool = True,
         include_relevant_context: bool = True,
+        enable_external_verification: bool = False,
     ) -> None:
         super().__init__(aggregation=aggregation)
         if llm is None:
@@ -332,6 +367,7 @@ class _SinglePromptGroundednessEngine(_BaseGroundednessEngine):
         self.llm = llm
         self.include_reasoning = include_reasoning
         self.include_relevant_context = include_relevant_context
+        self.enable_external_verification = enable_external_verification
 
     async def score(
         self,
@@ -342,6 +378,44 @@ class _SinglePromptGroundednessEngine(_BaseGroundednessEngine):
         return_prompts: bool = False,
         **_: Any,
     ) -> UQResult:
+        score_outputs, prompts = await self._run_stage1(
+            contexts=contexts,
+            answers=answers,
+            show_progress_bars=show_progress_bars,
+            return_prompts=return_prompts,
+        )
+        claims_data = [output["claims_data"] for output in score_outputs]
+
+        result = self.build_result(
+            queries=queries,
+            contexts=contexts,
+            answers=answers,
+            claims_data=claims_data,
+            metadata={
+                "mode": "single_prompt",
+                "aggregation": self.aggregation,
+                "include_reasoning": self.include_reasoning,
+                "include_relevant_context": self.include_relevant_context,
+                "enable_external_verification": self.enable_external_verification,
+                "prompts": prompts,
+            },
+        )
+        if return_prompts:
+            result.data["prompts"] = prompts
+        return result
+
+    async def _run_stage1(
+        self,
+        contexts: List[str],
+        answers: List[str],
+        show_progress_bars: bool,
+        return_prompts: bool,
+    ) -> Tuple[List[Dict[str, Any]], Optional[List[str]]]:
+        """Run the Stage 1 single-prompt call for every (context, answer) pair.
+
+        Returned as a helper so that composite engines (e.g. the search-augmented
+        one) can reuse the exact same decomposition pipeline.
+        """
         progress_bar = self.build_progress_bar(show_progress_bars)
         try:
             if progress_bar:
@@ -361,25 +435,8 @@ class _SinglePromptGroundednessEngine(_BaseGroundednessEngine):
             if progress_bar:
                 progress_bar.stop()
 
-        claims_data = [output["claims_data"] for output in score_outputs]
-        prompts = [output["prompt"] for output in score_outputs] if return_prompts else None
-
-        result = self.build_result(
-            queries=queries,
-            contexts=contexts,
-            answers=answers,
-            claims_data=claims_data,
-            metadata={
-                "mode": "single_prompt",
-                "aggregation": self.aggregation,
-                "include_reasoning": self.include_reasoning,
-                "include_relevant_context": self.include_relevant_context,
-                "prompts": prompts,
-            },
-        )
-        if return_prompts:
-            result.data["prompts"] = prompts
-        return result
+        prompts = [out["prompt"] for out in score_outputs] if return_prompts else None
+        return score_outputs, prompts
 
     async def _score_single(
         self,
@@ -393,6 +450,7 @@ class _SinglePromptGroundednessEngine(_BaseGroundednessEngine):
             answer=answer,
             include_reasoning=self.include_reasoning,
             include_relevant_context=self.include_relevant_context,
+            enable_external_verification=self.enable_external_verification,
         )
         messages = [
             SystemMessage(UNIFIED_GROUNDEDNESS_SYSTEM_PROMPT),
@@ -464,6 +522,18 @@ class _SinglePromptGroundednessEngine(_BaseGroundednessEngine):
             if not isinstance(relevant_context, list):
                 relevant_context = [str(relevant_context)]
 
+            # Stage-1 external-verification hints (only present when the flag is on).
+            need_external_check = bool(item.get("need_external_check", False))
+            raw_queries = item.get("search_queries", []) or []
+            if not isinstance(raw_queries, list):
+                raw_queries = [raw_queries]
+            search_queries = [str(q).strip() for q in raw_queries if str(q).strip()]
+
+            # Only trust the flag for verdicts where external check makes sense.
+            if verdict not in EXTERNAL_CHECK_VERDICTS:
+                need_external_check = False
+                search_queries = []
+
             claims_data.append(
                 {
                     "claim": claim,
@@ -475,6 +545,15 @@ class _SinglePromptGroundednessEngine(_BaseGroundednessEngine):
                     "reasoning": str(item.get("reasoning", "") or "").strip(),
                     "relevant_context": [str(x) for x in relevant_context],
                     "raw_judge_response": raw_text,
+                    "context_verdict": verdict,
+                    "need_external_check": need_external_check,
+                    "search_queries": search_queries,
+                    "world_verdict": "not_checked",
+                    "world_score": np.nan,
+                    "world_reasoning": "",
+                    "evidence_snippets": [],
+                    "evidence_urls": [],
+                    "raw_world_response": None,
                 }
             )
 
@@ -490,14 +569,133 @@ class _SinglePromptGroundednessEngine(_BaseGroundednessEngine):
         return start, start + len(anchor_text)
 
 
+class _SinglePromptWithSearchEngine(_SinglePromptGroundednessEngine):
+    """Single-prompt engine followed by an external factuality verification stage.
+
+    Claims whose Stage-1 ``context_verdict`` is in
+    :data:`EXTERNAL_CHECK_VERDICTS` and whose ``need_external_check`` flag is
+    ``True`` are routed through the provided :class:`ExternalVerifier` to
+    receive a ``world_verdict``. Everything else stays ``"not_checked"``.
+    """
+
+    def __init__(
+        self,
+        llm: BaseChatModel,
+        external_verifier: Any,
+        aggregation: str = "mean",
+        include_reasoning: bool = True,
+        include_relevant_context: bool = True,
+    ) -> None:
+        if external_verifier is None:
+            raise ValueError(
+                "_SinglePromptWithSearchEngine requires a non-None ExternalVerifier instance."
+            )
+        super().__init__(
+            llm=llm,
+            aggregation=aggregation,
+            include_reasoning=include_reasoning,
+            include_relevant_context=include_relevant_context,
+            enable_external_verification=True,
+        )
+        self.external_verifier = external_verifier
+
+    async def score(
+        self,
+        queries: List[str],
+        contexts: List[str],
+        answers: List[str],
+        show_progress_bars: bool = True,
+        return_prompts: bool = False,
+        return_world_prompts: bool = True,
+        **_: Any,
+    ) -> UQResult:
+        # Stage 1: reuse parent pipeline to decompose + context-verify.
+        score_outputs, prompts = await self._run_stage1(
+            contexts=contexts,
+            answers=answers,
+            show_progress_bars=show_progress_bars,
+            return_prompts=return_prompts,
+        )
+        claims_data = [out["claims_data"] for out in score_outputs]
+
+        # Stage 2+3: collect baseless / overclaim claims that should be checked.
+        from uqlm.scorers.longform.external_verifier import ClaimForExternal
+
+        pending: List[ClaimForExternal] = []
+        for i, claim_list in enumerate(claims_data):
+            for j, claim in enumerate(claim_list):
+                if (
+                    claim.get("context_verdict") in EXTERNAL_CHECK_VERDICTS
+                    and claim.get("need_external_check")
+                    and claim.get("search_queries")
+                ):
+                    pending.append(
+                        ClaimForExternal(
+                            claim=claim["claim"],
+                            search_queries=list(claim.get("search_queries", [])),
+                            context_reasoning=claim.get("reasoning") or None,
+                            key=(i, j),
+                        )
+                    )
+
+        if pending:
+            logger.debug(
+                "_SinglePromptWithSearchEngine: dispatching %d claims to ExternalVerifier",
+                len(pending),
+            )
+            verdicts = await self.external_verifier.verify(pending)
+            verdict_by_key = {v.key: v for v in verdicts}
+            for (i, j), v in verdict_by_key.items():
+                claim = claims_data[i][j]
+                claim["world_verdict"] = v.world_verdict
+                claim["world_score"] = VERDICT_SCORE_MAP.get(v.world_verdict, np.nan)
+                claim["world_reasoning"] = v.reasoning
+                claim["evidence_snippets"] = list(v.evidence_snippets)
+                claim["evidence_urls"] = list(v.evidence_urls)
+                claim["raw_world_response"] = v.raw_response or None
+                # Stage 3 prompt — stored per-claim for full pipeline traceability.
+                if return_world_prompts:
+                    claim["world_prompt"] = v.world_prompt or ""
+
+        result = self.build_result(
+            queries=queries,
+            contexts=contexts,
+            answers=answers,
+            claims_data=claims_data,
+            metadata={
+                "mode": "single_prompt_with_search",
+                "aggregation": self.aggregation,
+                "include_reasoning": self.include_reasoning,
+                "include_relevant_context": self.include_relevant_context,
+                "enable_external_verification": True,
+                "num_external_checks": len(pending),
+                "prompts": prompts,
+            },
+        )
+        if return_prompts:
+            result.data["prompts"] = prompts
+        if return_world_prompts:
+            # Collect world_prompts as a parallel list: per-answer, per-claim.
+            # Claims that were not externally checked get an empty string.
+            result.data["world_prompts"] = [
+                [c.get("world_prompt", "") for c in claim_list]
+                for claim_list in claims_data
+            ]
+        return result
+
+
+_VALID_MODES = ("two_stage", "single_prompt", "single_prompt_with_search")
+
+
 class ContextGroundednessScorer:
     """
     Public groundedness scorer with mode-based strategy selection.
 
     Parameters
     ----------
-    mode : str, default="two_stage"
-        Scoring strategy. Must be one of ``"two_stage"`` or ``"single_prompt"``.
+    mode : str, default="single_prompt"
+        Scoring strategy. One of ``"two_stage"``, ``"single_prompt"``, or
+        ``"single_prompt_with_search"``.
     nli_llm : BaseChatModel, optional
         LLM for entailment verification in ``two_stage`` mode.
     claim_decomposition_llm : BaseChatModel, optional
@@ -505,13 +703,16 @@ class ContextGroundednessScorer:
     entailment_style : str, default="nli_classification"
         Entailment prompt style for ``two_stage`` mode.
     llm : BaseChatModel, optional
-        LLM for ``single_prompt`` mode.
+        LLM for ``single_prompt`` / ``single_prompt_with_search`` Stage 1.
     aggregation : str, default="mean"
         Response-level aggregation method.
     include_reasoning : bool, default=True
-        Whether ``single_prompt`` mode should request reasoning.
+        Whether single-prompt modes should request reasoning.
     include_relevant_context : bool, default=True
-        Whether ``single_prompt`` mode should request relevant context excerpts.
+        Whether single-prompt modes should request relevant context excerpts.
+    external_verifier : ExternalVerifier, optional
+        Required for ``single_prompt_with_search`` mode. Performs Stage 3
+        world-knowledge verification for baseless / overclaim claims.
     """
 
     def __init__(
@@ -524,10 +725,11 @@ class ContextGroundednessScorer:
         aggregation: str = "mean",
         include_reasoning: bool = True,
         include_relevant_context: bool = True,
+        external_verifier: Optional[Any] = None,
     ) -> None:
-        if mode not in ("two_stage", "single_prompt"):
+        if mode not in _VALID_MODES:
             raise ValueError(
-                f"Invalid mode: {mode!r}. Must be 'two_stage' or 'single_prompt'."
+                f"Invalid mode: {mode!r}. Must be one of {_VALID_MODES}."
             )
 
         self.mode = mode
@@ -540,9 +742,21 @@ class ContextGroundednessScorer:
                 entailment_style=entailment_style,
                 aggregation=aggregation,
             )
-        else:
+        elif mode == "single_prompt":
             self._engine = _SinglePromptGroundednessEngine(
                 llm=llm,
+                aggregation=aggregation,
+                include_reasoning=include_reasoning,
+                include_relevant_context=include_relevant_context,
+            )
+        else:  # single_prompt_with_search
+            if external_verifier is None:
+                raise ValueError(
+                    "mode='single_prompt_with_search' requires an external_verifier argument."
+                )
+            self._engine = _SinglePromptWithSearchEngine(
+                llm=llm,
+                external_verifier=external_verifier,
                 aggregation=aggregation,
                 include_reasoning=include_reasoning,
                 include_relevant_context=include_relevant_context,
@@ -567,8 +781,21 @@ class ContextGroundednessScorer:
         return_raw_judge_responses: bool = False,
         show_progress_bars: bool = True,
         return_prompts: bool = False,
+        return_world_prompts: bool = True,
     ) -> UQResult:
-        """Score pre-generated answers against contexts and return ``UQResult``."""
+        """Score pre-generated answers against contexts and return ``UQResult``.
+
+        Parameters
+        ----------
+        return_world_prompts : bool, default=True
+            When ``True`` and ``mode="single_prompt_with_search"``, the full
+            Stage 3 (world-verifier) prompt is stored per-claim in
+            ``claims_data[i][j]["world_prompt"]`` and collected into
+            ``result.data["world_prompts"]`` (list-of-lists, parallel to
+            ``claims_data``). Claims that were not externally checked get an
+            empty string. Enabled by default so the full pipeline is always
+            traceable without extra flags.
+        """
         if not (len(queries) == len(contexts) == len(answers)):
             raise ValueError(
                 f"Input lists must have equal length. "
@@ -582,4 +809,5 @@ class ContextGroundednessScorer:
             return_raw_judge_responses=return_raw_judge_responses,
             show_progress_bars=show_progress_bars,
             return_prompts=return_prompts,
+            return_world_prompts=return_world_prompts,
         )

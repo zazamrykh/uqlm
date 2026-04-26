@@ -33,16 +33,15 @@ Evaluation approach
     span. The scorer produces a response-level score (0–1). We compute AUC-ROC
     using ``1 - response_score`` as the predicted probability of hallucination.
 
-**Confusion matrix** (optional):
+**Confusion matrix**:
 
-    For matched GT↔predicted pairs, we can compare the type mapping:
+    For matched GT↔predicted pairs, we compare the type mapping:
     - GT "Evident Conflict" / "Subtle Conflict" → expected predicted verdict "contradicted"
     - GT "Evident Baseless Info" / "Subtle Baseless Info" → expected predicted verdict "baseless"
 """
 
 import logging
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 
@@ -66,139 +65,6 @@ RAGTRUTH_LABEL_TO_CATEGORY: Dict[str, str] = {
 def _spans_overlap(s1: int, e1: int, s2: int, e2: int) -> bool:
     """Check if half-open intervals [s1, e1) and [s2, e2) overlap."""
     return s1 < e2 and s2 < e1
-
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class ClaimLevelMetrics:
-    """
-    Claim-level evaluation metrics.
-
-    Attributes
-    ----------
-    recall : float
-        Fraction of GT hallucination spans matched by at least one predicted
-        hallucination claim.
-    precision : float
-        Fraction of predicted hallucination claims that match at least one
-        GT hallucination span.
-    f1 : float
-        Harmonic mean of precision and recall.
-    n_gt_spans : int
-        Total number of ground truth hallucination spans.
-    n_pred_hallucinations : int
-        Total number of predicted hallucination claims (baseless + contradicted).
-    n_gt_matched : int
-        Number of GT spans matched by at least one prediction.
-    n_pred_matched : int
-        Number of predicted hallucination claims matched by at least one GT span.
-    """
-
-    recall: float
-    precision: float
-    f1: float
-    n_gt_spans: int
-    n_pred_hallucinations: int
-    n_gt_matched: int
-    n_pred_matched: int
-
-
-@dataclass
-class ResponseLevelMetrics:
-    """
-    Response-level evaluation metrics.
-
-    Attributes
-    ----------
-    auc_roc : float
-        AUC-ROC using ``1 - response_score`` as predicted hallucination probability.
-        NaN if sklearn is not available or if there is only one class.
-    n_responses : int
-        Total number of responses evaluated.
-    n_hallucinated : int
-        Number of responses with at least one GT hallucination span.
-    n_clean : int
-        Number of responses with no GT hallucination spans.
-    """
-
-    auc_roc: float
-    n_responses: int
-    n_hallucinated: int
-    n_clean: int
-
-
-@dataclass
-class ConfusionEntry:
-    """
-    A single matched pair for the confusion matrix analysis.
-
-    Attributes
-    ----------
-    gt_label_type : str
-        Original RAGTruth label_type (e.g. "Evident Conflict").
-    gt_category : str
-        Simplified category: "conflict" or "baseless".
-    predicted_verdict : str
-        The predicted verdict: "baseless" or "contradicted".
-    gt_text : str
-        The ground truth hallucination text span.
-    predicted_anchor : str
-        The predicted anchor_text.
-    answer_idx : int
-        Index of the answer in the input list.
-    """
-
-    gt_label_type: str
-    gt_category: str
-    predicted_verdict: str
-    gt_text: str
-    predicted_anchor: str
-    answer_idx: int
-
-
-@dataclass
-class RAGTruthEvalResult:
-    """
-    Full evaluation result from ``RAGTruthGrader.evaluate()``.
-
-    Attributes
-    ----------
-    claim_level : ClaimLevelMetrics
-        Claim-level precision, recall, F1.
-    response_level : ResponseLevelMetrics
-        Response-level AUC-ROC.
-    confusion_entries : List[ConfusionEntry]
-        Per-match details for confusion matrix analysis.
-    per_answer_details : List[Dict[str, Any]]
-        Per-answer breakdown with GT spans, predicted hallucinations, matches.
-    """
-
-    claim_level: ClaimLevelMetrics
-    response_level: ResponseLevelMetrics
-    confusion_entries: List[ConfusionEntry] = field(default_factory=list)
-    per_answer_details: List[Dict[str, Any]] = field(default_factory=list)
-
-    def confusion_matrix_summary(self) -> Dict[str, Dict[str, int]]:
-        """
-        Build a confusion matrix: GT category → predicted verdict → count.
-
-        Returns
-        -------
-        Dict[str, Dict[str, int]]
-            E.g. ``{"conflict": {"contradicted": 5, "baseless": 2}, ...}``
-        """
-        matrix: Dict[str, Dict[str, int]] = {}
-        for entry in self.confusion_entries:
-            cat = entry.gt_category
-            pred = entry.predicted_verdict
-            if cat not in matrix:
-                matrix[cat] = {}
-            matrix[cat][pred] = matrix[cat].get(pred, 0) + 1
-        return matrix
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +95,7 @@ class RAGTruthGrader:
         gt_hallucination_labels: List[List[Dict[str, Any]]],
         claim_verdicts: List[List[Any]],
         response_scores: Optional[List[float]] = None,
-    ) -> RAGTruthEvalResult:
+    ) -> Dict[str, Any]:
         """
         Evaluate predicted claim verdicts against RAGTruth ground truth.
 
@@ -252,8 +118,18 @@ class RAGTruthGrader:
 
         Returns
         -------
-        RAGTruthEvalResult
-            Full evaluation result with claim-level and response-level metrics.
+        Dict[str, Any]
+            Dictionary with the following keys:
+
+            - ``claim_level``: dict with ``recall``, ``precision``, ``f1``,
+              ``n_gt_spans``, ``n_pred_hallucinations``, ``n_gt_matched``,
+              ``n_pred_matched``.
+            - ``response_level``: dict with ``auc_roc`` (``NaN`` if unavailable),
+              ``n_responses``, ``n_hallucinated``, ``n_clean``.
+            - ``confusion_matrix``: nested dict ``{gt_category: {predicted_verdict: count}}``,
+              e.g. ``{"conflict": {"contradicted": 5, "baseless": 2}, ...}``.
+            - ``per_answer_details``: list of per-answer breakdowns with GT spans,
+              predicted hallucinations, matches, and local ``confusion_entries``.
         """
         if len(gt_hallucination_labels) != len(claim_verdicts):
             raise ValueError(
@@ -266,7 +142,7 @@ class RAGTruthGrader:
         total_gt_matched = 0
         total_pred_hallucinations = 0
         total_pred_matched = 0
-        confusion_entries: List[ConfusionEntry] = []
+        confusion_matrix: Dict[str, Dict[str, int]] = {}
         per_answer_details: List[Dict[str, Any]] = []
 
         for i, (gt_spans, verdicts) in enumerate(
@@ -283,7 +159,13 @@ class RAGTruthGrader:
             total_gt_matched += detail["n_gt_matched"]
             total_pred_hallucinations += detail["n_pred_hallucinations"]
             total_pred_matched += detail["n_pred_matched"]
-            confusion_entries.extend(detail["confusion_entries"])
+
+            for entry in detail["confusion_entries"]:
+                cat = entry["gt_category"]
+                pred = entry["predicted_verdict"]
+                if cat not in confusion_matrix:
+                    confusion_matrix[cat] = {}
+                confusion_matrix[cat][pred] = confusion_matrix[cat].get(pred, 0) + 1
 
         # Claim-level metrics
         recall = total_gt_matched / total_gt_spans if total_gt_spans > 0 else 1.0
@@ -298,28 +180,28 @@ class RAGTruthGrader:
             else 0.0
         )
 
-        claim_metrics = ClaimLevelMetrics(
-            recall=recall,
-            precision=precision,
-            f1=f1,
-            n_gt_spans=total_gt_spans,
-            n_pred_hallucinations=total_pred_hallucinations,
-            n_gt_matched=total_gt_matched,
-            n_pred_matched=total_pred_matched,
-        )
+        claim_level = {
+            "recall": recall,
+            "precision": precision,
+            "f1": f1,
+            "n_gt_spans": total_gt_spans,
+            "n_pred_hallucinations": total_pred_hallucinations,
+            "n_gt_matched": total_gt_matched,
+            "n_pred_matched": total_pred_matched,
+        }
 
         # Response-level metrics
-        response_metrics = self._compute_response_level(
+        response_level = self._compute_response_level(
             gt_hallucination_labels=gt_hallucination_labels,
             response_scores=response_scores,
         )
 
-        return RAGTruthEvalResult(
-            claim_level=claim_metrics,
-            response_level=response_metrics,
-            confusion_entries=confusion_entries,
-            per_answer_details=per_answer_details,
-        )
+        return {
+            "claim_level": claim_level,
+            "response_level": response_level,
+            "confusion_matrix": confusion_matrix,
+            "per_answer_details": per_answer_details,
+        }
 
     def _evaluate_single(
         self,
@@ -356,7 +238,7 @@ class RAGTruthGrader:
         # Track which GT spans and predictions are matched
         gt_matched = [False] * n_gt_spans
         pred_matched = [False] * n_pred_hallucinations
-        confusion_entries: List[ConfusionEntry] = []
+        confusion_entries: List[Dict[str, Any]] = []
 
         for gi, gt_span in enumerate(valid_gt_spans):
             gt_start = gt_span["start"]
@@ -376,14 +258,14 @@ class RAGTruthGrader:
                     pred_matched[pi] = True
 
                     confusion_entries.append(
-                        ConfusionEntry(
-                            gt_label_type=gt_label_type,
-                            gt_category=gt_category,
-                            predicted_verdict=pred_verdict,
-                            gt_text=gt_text,
-                            predicted_anchor=pred_anchor,
-                            answer_idx=answer_idx,
-                        )
+                        {
+                            "gt_label_type": gt_label_type,
+                            "gt_category": gt_category,
+                            "predicted_verdict": pred_verdict,
+                            "gt_text": gt_text,
+                            "predicted_anchor": pred_anchor,
+                            "answer_idx": answer_idx,
+                        }
                     )
 
         n_gt_matched = sum(gt_matched)
@@ -421,7 +303,7 @@ class RAGTruthGrader:
     def _compute_response_level(
         gt_hallucination_labels: List[List[Dict[str, Any]]],
         response_scores: Optional[List[float]],
-    ) -> ResponseLevelMetrics:
+    ) -> Dict[str, Any]:
         """
         Compute response-level AUC-ROC.
 
@@ -443,7 +325,7 @@ class RAGTruthGrader:
         n_hallucinated = sum(gt_binary)
         n_clean = n_responses - n_hallucinated
 
-        auc_roc = np.nan
+        auc_roc = float(np.nan)
 
         if response_scores is not None and n_hallucinated > 0 and n_clean > 0:
             try:
@@ -459,9 +341,9 @@ class RAGTruthGrader:
             except ValueError as exc:
                 logger.warning("AUC-ROC computation failed: %s", exc)
 
-        return ResponseLevelMetrics(
-            auc_roc=auc_roc,
-            n_responses=n_responses,
-            n_hallucinated=n_hallucinated,
-            n_clean=n_clean,
-        )
+        return {
+            "auc_roc": auc_roc,
+            "n_responses": n_responses,
+            "n_hallucinated": n_hallucinated,
+            "n_clean": n_clean,
+        }

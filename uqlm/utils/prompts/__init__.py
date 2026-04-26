@@ -25,6 +25,14 @@ from uqlm.utils.prompts.groundedness_prompts import (
     UNIFIED_GROUNDEDNESS_SYSTEM_PROMPT,
     get_unified_groundedness_prompt,
 )
+from uqlm.utils.prompts.external_factuality_prompts import (
+    EXTERNAL_FACTUALITY_SYSTEM_PROMPT,
+    WORLD_VERDICT_VALUES,
+    SnippetForPrompt,
+    format_snippets,
+    get_external_factuality_prompt,
+    parse_external_factuality_response,
+)
 
 __all__ = [
     "TEMPLATE_TO_INSTRUCTION",
@@ -40,4 +48,10 @@ __all__ = [
     "SUBJECTIVE_SYSTEM_PROMPT",
     "UNIFIED_GROUNDEDNESS_SYSTEM_PROMPT",
     "get_unified_groundedness_prompt",
+    "EXTERNAL_FACTUALITY_SYSTEM_PROMPT",
+    "WORLD_VERDICT_VALUES",
+    "SnippetForPrompt",
+    "format_snippets",
+    "get_external_factuality_prompt",
+    "parse_external_factuality_response",
 ]

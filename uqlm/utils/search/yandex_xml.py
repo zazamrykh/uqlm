@@ -1,5 +1,5 @@
 """
-Yandex Cloud Search API v2 client (XML response).
+Yandex Cloud Search API v2 client (XML response) with client-side rate limiting.
 
 The legacy v1 GET endpoint (``yandex.ru/search/xml?folderid=...``) was
 blocked in 2024. The current supported path is:
@@ -29,9 +29,11 @@ Env vars (see ``.env.example``):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
+import time
 from typing import List, Optional
 from urllib.parse import urlparse
 from xml.etree import ElementTree as ET
@@ -46,6 +48,9 @@ DEFAULT_ENDPOINT = "https://searchapi.api.cloud.yandex.net/v2/web/search"
 DEFAULT_TIMEOUT = 20.0
 MAX_QUERY_CHARS = 400
 MAX_QUERY_WORDS = 40
+
+# Conservative default: 7 RPS (Yandex limit is 10 RPS, we leave headroom).
+DEFAULT_MAX_RPS = 7
 
 # Yandex Search API v2 search type constants.
 SEARCH_TYPE_RU = "SEARCH_TYPE_RU"
@@ -108,6 +113,7 @@ class YandexXmlSearchClient(SearchClient):
         endpoint: str = DEFAULT_ENDPOINT,
         timeout: float = DEFAULT_TIMEOUT,
         http_client: Optional[httpx.AsyncClient] = None,
+        max_rps: float = DEFAULT_MAX_RPS,
     ) -> None:
         if not folder_id or not api_key:
             raise ValueError(
@@ -121,11 +127,19 @@ class YandexXmlSearchClient(SearchClient):
         self._owned_client = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout)
 
+        # Client-side rate limiter: token bucket with 1 token per (1/max_rps) seconds.
+        # _rps_lock serialises token acquisition; _last_request_time tracks last call.
+        self._max_rps = max(0.1, float(max_rps))
+        self._min_interval = 1.0 / self._max_rps  # seconds between requests
+        self._rps_lock = asyncio.Lock()
+        self._last_request_time: float = 0.0
+
     @classmethod
     def from_env(
         cls,
         folder_env: str = "YANDEX_CLOUD_FOLDER_ID",
         key_env: str = "YANDEX_CLOUD_API_KEY",
+        max_rps: float = DEFAULT_MAX_RPS,
         **kwargs,
     ) -> "YandexXmlSearchClient":
         """Instantiate from environment variables.
@@ -140,7 +154,7 @@ class YandexXmlSearchClient(SearchClient):
                 f"Missing Yandex Cloud credentials: set {folder_env} and {key_env} "
                 f"env vars. See .env.example for instructions."
             )
-        return cls(folder_id=folder_id, api_key=api_key, **kwargs)
+        return cls(folder_id=folder_id, api_key=api_key, max_rps=max_rps, **kwargs)
 
     async def aclose(self) -> None:
         if self._owned_client:
@@ -152,17 +166,40 @@ class YandexXmlSearchClient(SearchClient):
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.aclose()
 
+    async def _acquire_rate_limit_token(self) -> None:
+        """Block until we are allowed to issue the next request.
+
+        Implements a simple leaky-bucket: ensures at least ``_min_interval``
+        seconds elapse between consecutive HTTP calls from this client instance.
+        """
+        async with self._rps_lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request_time
+            wait = self._min_interval - elapsed
+            if wait > 0:
+                logger.debug(
+                    "YandexXmlSearchClient: rate-limit sleep %.3fs (max_rps=%.1f)",
+                    wait,
+                    self._max_rps,
+                )
+                await asyncio.sleep(wait)
+            self._last_request_time = time.monotonic()
+
     async def search(self, query: str, top_k: int = 5) -> List[SearchHit]:
         """Run one search query and return normalized hits.
 
         Uses Yandex Cloud Search API v2 (POST, JSON body, base64-encoded XML
         response). The ``rawData`` field in the JSON response is base64-decoded
         to obtain the standard ``<yandexsearch>`` XML document.
+
+        Respects the client-side rate limit (``max_rps``) to avoid 429 errors.
         """
         trimmed_query = _trim_query(query)
         if not trimmed_query:
             logger.debug("YandexXmlSearchClient.search received empty query")
             return []
+
+        await self._acquire_rate_limit_token()
 
         body = {
             "folderId": self.folder_id,

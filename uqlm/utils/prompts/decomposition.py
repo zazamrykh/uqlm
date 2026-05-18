@@ -41,11 +41,11 @@ def get_claim_breakdown_prompt(response: str) -> str:
     """
 
     claim_breakdown_prompt = f"""
-    Please breakdown the following passage into independent fact pieces. 
+    Please breakdown the following passage into independent fact pieces.
 
     Step 1: For each sentence, you should break it into several fact pieces. Each fact piece should only contain one single independent fact. Normally the format of a fact piece is "subject + verb + object". If the sentence does not contain a verb, you can use "be" as the verb.
 
-    Step 2: Do this for all the sentences. Output each piece of fact in one single line starting with ###. Do not include other formatting. 
+    Step 2: Do this for all the sentences. Output each piece of fact in one single line starting with ###. Do not include other formatting.
 
     Step 3: Each atomic fact should be self-contained. Do not use pronouns as the subject of a piece of fact, such as he, she, it, this that, use the original subject whenever possible.
 
@@ -65,7 +65,7 @@ def get_claim_breakdown_prompt(response: str) -> str:
     ### Michael Collins was the Command Module Pilot for the Apollo 11 mission in 1969.
 
     Example 2:
-    League of Legends (often abbreviated as LoL) is a multiplayer online battle arena (MOBA) video game developed and published by Riot Games. 
+    League of Legends (often abbreviated as LoL) is a multiplayer online battle arena (MOBA) video game developed and published by Riot Games.
     ### League of Legends is a video game.
     ### League of Legends is often abbreviated as LoL.
     ### League of Legends is a multiplayer online battle arena.
@@ -85,7 +85,7 @@ def get_claim_breakdown_prompt(response: str) -> str:
     Hi
     ### NONE
 
-    Now it's your turn. Here is the passage: 
+    Now it's your turn. Here is the passage:
 
     {response}
 
@@ -126,3 +126,151 @@ def get_factoid_breakdown_template(response: str) -> str:
     """
 
     return factoid_template
+
+
+# ---------------------------------------------------------------------------
+# Multi-class decomposer prompt (violated-support-agnostic)
+# ---------------------------------------------------------------------------
+#
+# Used by ``MultiClassScorer``. Produces a JSON array of atomic claims with a
+# verbatim ``anchor_text`` substring from the answer. The prompt describes the
+# four ``violated_supports`` (context / factuality / instruction / logical)
+# that will be evaluated downstream so the decomposer extracts every kind of
+# proposition any verifier will need, including reasoning steps that a plain
+# "factual claim" prompt would skip.
+#
+# Output schema per item:
+#
+#   {"claim": "<atomic proposition>", "anchor_text": "<verbatim substring>"}
+#
+# No verdict and no per-support fields are produced here — decomposition is
+# strictly violated-support-agnostic.
+
+MULTICLASS_DECOMPOSITION_SYSTEM_PROMPT = """\
+You decompose an LLM answer into atomic claims for downstream hallucination \
+detection. You must respond with a valid JSON array and nothing else — no \
+markdown fences, no explanation outside the JSON.\
+"""
+
+
+def get_multiclass_decomposition_prompt(input_text: str, answer: str) -> str:
+    """Build the user prompt for violated-support-agnostic claim decomposition.
+
+    The detector receives a single ``input_text`` — everything that was
+    visible to the model when it produced ``answer``. This single string
+    may contain both the user's instruction and grounding material
+    (documents, JSON, citations) intermixed; downstream verifiers decide
+    which parts they care about.
+
+    Downstream each emitted claim is independently evaluated against four
+    "violated_supports":
+
+    - ``context``     — claim vs grounding material inside ``input_text``;
+    - ``factuality``  — claim vs real-world knowledge;
+    - ``instruction`` — claim vs the user's instruction inside ``input_text``;
+    - ``logical``     — claim vs prior claims in the same answer, including
+      step-by-step reasoning.
+
+    Parameters
+    ----------
+    input_text:
+        The full input that was visible to the model. May contain the
+        user's instruction, retrieved documents, structured data, etc.
+        All of it intermixed.
+    answer:
+        The model's answer; the source of every emitted ``anchor_text``.
+    """
+    return f"""\
+## Input text (everything the model saw)
+{input_text}
+
+## Answer to decompose
+{answer}
+
+## Task
+
+Decompose the Answer into atomic claims. Each claim must be a single, \
+self-contained proposition (typically "subject + verb + object"). Do NOT use \
+pronouns (he, she, it, this, that); always restate the original subject.
+
+You are NOT judging whether a claim is correct. You only extract claims.
+
+### What counts as a claim
+
+A downstream system will independently evaluate each claim against four \
+violated_supports. You must therefore emit a claim for any proposition that \
+*any* of these supports could meaningfully evaluate:
+
+1. **context**     — propositions whose truth depends on grounding material \
+inside the Input text (retrieved documents, JSON, citations, structured data).
+2. **factuality**  — propositions whose truth depends on real-world \
+knowledge that is NOT provided in the Input text.
+3. **instruction** — propositions about whether the Answer obeys the user's \
+instruction inside the Input text (its scope, format, length, constraints). \
+Emit such a claim only when the Answer makes a clear decision that can be \
+checked against the instruction.
+4. **logical**     — propositions inside a chain of reasoning, including \
+intermediate steps. Math / algebra / logical derivation steps must each be \
+emitted as a separate claim, even if they would not look like "factual" \
+claims in isolation.
+
+If a sentence carries no proposition (greeting, filler), skip it.
+
+### Examples of biographical / world-knowledge claims
+
+Example A:
+Michael Collins (born October 31, 1930) is a retired American astronaut and test pilot who was the Command Module Pilot for the Apollo 11 mission in 1969.
+### Michael Collins was born on October 31, 1930.
+### Michael Collins is retired.
+### Michael Collins is an American.
+### Michael Collins was an astronaut.
+### Michael Collins was a test pilot.
+### Michael Collins was the Command Module Pilot for the Apollo 11 mission in 1969.
+
+Example B:
+League of Legends (often abbreviated as LoL) is a multiplayer online battle arena (MOBA) video game developed and published by Riot Games.
+### League of Legends is a video game.
+### League of Legends is often abbreviated as LoL.
+### League of Legends is a multiplayer online battle arena.
+### League of Legends is a MOBA video game.
+### League of Legends is developed by Riot Games.
+### League of Legends is published by Riot Games.
+
+### Example of a reasoning chain (logical-support claims)
+
+Example C:
+We have x^2 - 3x = 4, so x^2 - 3x - 4 = 0, which factors as (x - 4)(x + 1) = 0.
+### x^2 - 3x = 4.
+### x^2 - 3x - 4 = 0.
+### x^2 - 3x - 4 factors as (x - 4)(x + 1).
+### (x - 4)(x + 1) = 0.
+
+(The ``###`` lines above are only illustrative of the granularity expected; \
+your final output must be JSON, not lines starting with ``###``.)
+
+### anchor_text rules
+
+For every claim you emit, also return ``anchor_text``: an EXACT verbatim \
+contiguous substring of the Answer that the claim was extracted from. Copy \
+it character-by-character; ``answer.find(anchor_text)`` must succeed.
+
+- Do not paraphrase the anchor.
+- Do not trim punctuation in a way that breaks exact matching.
+- For multi-clause sentences, use the smallest contiguous span that fully \
+contains the claim.
+- If the same proposition appears multiple times in the Answer, anchor it \
+to its first occurrence.
+
+### Output format
+
+Return ONLY a JSON array. No markdown fences. No prose around the JSON.
+
+[
+  {{
+    "claim": "atomic proposition rephrased as a complete sentence",
+    "anchor_text": "verbatim substring from the Answer"
+  }}
+]
+
+If the Answer contains no propositions to extract, return ``[]``.
+"""

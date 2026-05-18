@@ -13,12 +13,23 @@
 # limitations under the License.
 
 import asyncio
-import time
-from typing import List, Optional, Callable
-from uqlm.utils.prompts import get_claim_breakdown_prompt
-from rich.progress import Progress
-from langchain_core.language_models.chat_models import BaseChatModel
+import json
+import logging
 import re
+import time
+from typing import Callable, List, Optional
+
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from rich.progress import Progress
+
+from uqlm.utils.prompts import get_claim_breakdown_prompt
+from uqlm.utils.prompts.decomposition import (
+    MULTICLASS_DECOMPOSITION_SYSTEM_PROMPT,
+    get_multiclass_decomposition_prompt,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class ResponseDecomposer:
@@ -190,3 +201,150 @@ class ResponseDecomposer:
         Check if the LLM response indicates no claims are present. Detects the template-instructed "### NONE" response and common variations.
         """
         return bool(re.search(r"###\s*none\b", llm_response.strip(), re.IGNORECASE))
+
+    # ------------------------------------------------------------------
+    # Multi-class decomposition (violated-support-agnostic)
+    # ------------------------------------------------------------------
+
+    async def decompose_multiclass(
+        self,
+        input_texts: List[str],
+        answers: List[str],
+        progress_bar: Optional[Progress] = None,
+    ) -> List[List[dict]]:
+        """Decompose each answer into atomic claims for the multi-class scorer.
+
+        Each returned claim is a plain dict with the keys ``claim``,
+        ``anchor_text``, ``start_offset`` and ``end_offset``. Offsets are
+        computed via exact substring search; on miss they are set to ``-1``.
+
+        Parameters
+        ----------
+        input_texts:
+            Everything visible to the model when it produced each answer
+            (instruction + grounding material mixed). One per answer.
+        answers:
+            The model answers to decompose.
+        progress_bar:
+            Optional ``rich`` progress bar.
+
+        Returns
+        -------
+        list[list[dict]]
+            One list of per-claim dicts per input answer.
+        """
+        if len(input_texts) != len(answers):
+            raise ValueError(
+                "input_texts and answers must have equal length. "
+                f"Got {len(input_texts)} and {len(answers)}."
+            )
+        if not self.claim_decomposition_llm:
+            raise ValueError(
+                "claim_decomposition_llm must be provided to decompose responses."
+            )
+
+        if progress_bar:
+            self.progress_task = progress_bar.add_task(
+                "  - Multiclass decomposition...", total=len(answers)
+            )
+
+        tasks = [
+            self._decompose_multiclass_single(input_text, answer, progress_bar)
+            for input_text, answer in zip(input_texts, answers)
+        ]
+        results = await asyncio.gather(*tasks)
+        time.sleep(0.1)
+        return results
+
+    async def _decompose_multiclass_single(
+        self,
+        input_text: str,
+        answer: str,
+        progress_bar: Optional[Progress] = None,
+    ) -> List[dict]:
+        prompt = get_multiclass_decomposition_prompt(
+            input_text=input_text, answer=answer
+        )
+        messages = [
+            SystemMessage(MULTICLASS_DECOMPOSITION_SYSTEM_PROMPT),
+            HumanMessage(prompt),
+        ]
+        try:
+            generation = await self.claim_decomposition_llm.ainvoke(messages)
+            raw_text = generation.content
+        except Exception as exc:
+            logger.warning("Multiclass decomposition LLM call failed: %s", exc)
+            raw_text = ""
+
+        if progress_bar:
+            try:
+                progress_bar.update(self.progress_task, advance=1)
+            except Exception:
+                logger.debug("Could not advance multiclass-decomposition progress bar")
+
+        return self._parse_multiclass_response(raw_text=raw_text, answer=answer)
+
+    @staticmethod
+    def _parse_multiclass_response(raw_text: str, answer: str) -> List[dict]:
+        """Parse the LLM JSON response into normalized claim dictionaries."""
+        if not raw_text:
+            return []
+
+        cleaned = re.sub(r"```(?:json)?\s*", "", raw_text).strip()
+        cleaned = re.sub(r"```\s*$", "", cleaned).strip()
+
+        match = re.search(r"\[.*\]", cleaned, re.DOTALL)
+        if not match:
+            logger.warning(
+                "Multiclass decomposer: no JSON array found in LLM response "
+                "(first 200 chars): %s",
+                raw_text[:200],
+            )
+            return []
+
+        try:
+            items = json.loads(match.group())
+        except json.JSONDecodeError as exc:
+            logger.warning("Multiclass decomposer JSON parse error: %s", exc)
+            return []
+
+        if not isinstance(items, list):
+            logger.warning(
+                "Multiclass decomposer: expected JSON array, got %s",
+                type(items).__name__,
+            )
+            return []
+
+        claims: List[dict] = []
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                logger.debug(
+                    "Multiclass decomposer: skipping non-dict item at index %d", i
+                )
+                continue
+            claim = str(item.get("claim", "") or "").strip()
+            anchor_text = str(item.get("anchor_text", "") or "").strip()
+            if not claim or not anchor_text:
+                logger.debug(
+                    "Multiclass decomposer: skipping item %d (missing claim/anchor)",
+                    i,
+                )
+                continue
+            start, end = _find_offsets(anchor_text, answer)
+            claims.append(
+                {
+                    "claim": claim,
+                    "anchor_text": anchor_text,
+                    "start_offset": start,
+                    "end_offset": end,
+                }
+            )
+        return claims
+
+
+def _find_offsets(anchor_text: str, answer: str) -> tuple[int, int]:
+    """Locate ``anchor_text`` inside ``answer``. Returns ``(-1, -1)`` on miss."""
+    start = answer.find(anchor_text)
+    if start < 0:
+        return -1, -1
+    return start, start + len(anchor_text)

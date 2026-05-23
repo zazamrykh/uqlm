@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional
 
 from langchain_core.language_models.chat_models import BaseChatModel
@@ -203,18 +204,20 @@ class MultiClassScorer:
         requested = self._resolve_requested_supports(violated_supports)
 
         # Stage 1 — decomposition.
+        t_decomp = time.perf_counter()
         claim_sets = await self._decomposer.decompose_multiclass(
             input_texts=input_texts, answers=answers
         )
+        decomp_wall_s = time.perf_counter() - t_decomp
 
         # Initialise the violated_supports dict for every claim.
         for claim_list in claim_sets:
             for claim in claim_list:
                 claim["violated_supports"] = {}
 
-        # Stage 2 — per-support verification, one verifier-call per (answer, support).
-        per_support_outputs: Dict[str, List[List[dict]]] = {s: [] for s in requested}
-        for i, claim_list in enumerate(claim_sets):
+        # Stage 2 — per-support verification.
+        t_verify = time.perf_counter()
+        async def _verify_one_answer(i: int, claim_list: List[dict]) -> Dict[str, List[dict]]:
             tasks: Dict[str, Awaitable[List[dict]]] = {}
             for support in requested:
                 verifier_fn, base_kwargs = self._verifiers[support]
@@ -224,15 +227,21 @@ class MultiClassScorer:
                 tasks[support] = verifier_fn(claims=claim_list, **kwargs)
 
             logger.info(
-                "MultiClassScorer: dispatching answer %d/%d -> %d claims x %d supports = %d "
-                "verifier batches (each verifier internally fans out across all claims)",
+                "MultiClassScorer: dispatching answer %d/%d -> %d claims x %d supports "
+                "(each verifier internally fans out across all claims)",
                 i + 1, len(claim_sets), len(claim_list), len(tasks),
-                len(tasks),
             )
-            # Run all supports for this answer concurrently.
             support_results = await asyncio.gather(*tasks.values())
-            for support, results in zip(tasks.keys(), support_results):
-                per_support_outputs[support].append(results)
+            return dict(zip(tasks.keys(), support_results))
+
+        per_answer = await asyncio.gather(
+            *[_verify_one_answer(i, cl) for i, cl in enumerate(claim_sets)]
+        )
+
+        per_support_outputs: Dict[str, List[List[dict]]] = {s: [] for s in requested}
+        for answer_map in per_answer:
+            for support in requested:
+                per_support_outputs[support].append(answer_map[support])
 
         # Merge per-support results into each claim.
         for support, answer_results in per_support_outputs.items():
@@ -259,11 +268,14 @@ class MultiClassScorer:
             "response_scores": response_scores,
             "overall_response_scores": overall_response_scores,
         }
+        verify_wall_s = time.perf_counter() - t_verify
         metadata: Dict[str, Any] = {
             "mode": "multiclass",
             "aggregation": self._aggregation,
             "available_supports": self.available_supports,
             "requested_supports": requested,
+            "decomp_wall_s": float(decomp_wall_s),
+            "verify_wall_s": float(verify_wall_s),
         }
         if return_prompts:
             data["decomposer_prompts"] = None  # decomposer does not surface them yet
